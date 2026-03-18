@@ -1,0 +1,52 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 222 47% 5%;
+    --foreground: 210 20% 90%;
+    --card: 222 47% 8%;
+    --card-foreground: 210 20% 90%;
+    --primary: 142 70% 45%;
+    --primary-foreground: 0 0% 100%;
+    --muted: 222 30% 15%;
+    --muted-foreground: 215 15% 55%;
+    --accent: 38 92% 50%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 222 20% 18%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-mono;
+  }
+}
+
+/* Terminal-style table */
+.data-table {
+  @apply w-full text-sm;
+}
+.data-table th {
+  @apply text-left px-3 py-2 text-muted-foreground font-medium border-b border-border uppercase text-xs tracking-wider;
+}
+.data-table td {
+  @apply px-3 py-2 border-b border-border/50;
+}
+.data-table tr:hover td {
+  @apply bg-muted/50;
+}
+
+/* Positive/negative coloring */
+.text-positive { @apply text-green-400; }
+.text-negative { @apply text-red-400; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: hsl(222, 47%, 5%); }
+::-webkit-scrollbar-thumb { background: hsl(222, 20%, 25%); border-radius: 3px; }
