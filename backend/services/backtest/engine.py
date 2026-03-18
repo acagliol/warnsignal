@@ -1,0 +1,292 @@
+"""Backtest engine for the WARN distress signal event study.
+
+Design principles:
+- No look-ahead bias: signals fire on filing_date, entry at T+1 open
+- Equal weight across open positions
+- Configurable holding period and max concurrent positions
+- Short-only for WARN distress signals
+"""
+
+import logging
+from datetime import date, timedelta
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Trade:
+    filing_id: int
+    ticker: str
+    signal_date: date
+    entry_date: date
+    exit_date: date
+    entry_price: float
+    exit_price: float
+    return_pct: float  # Short return: (entry - exit) / entry
+    hold_days: int
+
+
+@dataclass
+class BacktestConfig:
+    hold_days: int = 30
+    max_positions: int = 20
+    min_score: float = 0.0
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    transaction_cost_bps: float = 10.0  # 10 bps per leg
+
+
+@dataclass
+class OpenPosition:
+    filing_id: int
+    ticker: str
+    signal_date: date
+    entry_date: date
+    target_exit_date: date
+    entry_price: float
+
+
+@dataclass
+class BacktestResult:
+    trades: List[Trade] = field(default_factory=list)
+    equity_curve: List[Dict] = field(default_factory=list)
+    config: BacktestConfig = field(default_factory=BacktestConfig)
+
+
+def validate_no_lookahead(signals_df: pd.DataFrame, prices_df: pd.DataFrame):
+    """Validate that no look-ahead bias exists in the signal data.
+
+    Raises AssertionError if any signal uses future data.
+    """
+    for _, sig in signals_df.iterrows():
+        signal_date = sig["signal_date"]
+
+        # Assert: all price data used for scoring must be on or before signal_date
+        if "latest_price_date" in sig and pd.notna(sig["latest_price_date"]):
+            assert sig["latest_price_date"] <= signal_date, (
+                f"Look-ahead bias: signal on {signal_date} uses price from {sig['latest_price_date']}"
+            )
+
+
+def run_backtest(
+    signals_df: pd.DataFrame,
+    prices_dict: Dict[str, pd.DataFrame],
+    config: BacktestConfig = None,
+) -> BacktestResult:
+    """Run the WARN signal short backtest.
+
+    Args:
+        signals_df: DataFrame with columns:
+            filing_id, ticker, signal_date, composite_score, sector
+        prices_dict: Dict of ticker -> DataFrame with 'date', 'open', 'close'
+        config: Backtest configuration
+
+    Returns:
+        BacktestResult with trades and equity curve
+    """
+    if config is None:
+        config = BacktestConfig()
+
+    result = BacktestResult(config=config)
+
+    # Filter signals by score threshold
+    signals = signals_df[signals_df["composite_score"] >= config.min_score].copy()
+    signals = signals.sort_values("signal_date")
+
+    if config.start_date:
+        signals = signals[signals["signal_date"] >= config.start_date]
+    if config.end_date:
+        signals = signals[signals["signal_date"] <= config.end_date]
+
+    if signals.empty:
+        logger.warning("No signals after filtering")
+        return result
+
+    # Build a unified calendar of all trading dates
+    all_dates = set()
+    for ticker, df in prices_dict.items():
+        all_dates.update(df["date"].tolist())
+    trading_dates = sorted(all_dates)
+
+    if not trading_dates:
+        return result
+
+    # Convert signals to a date-indexed lookup
+    signals_by_date = {}
+    for _, sig in signals.iterrows():
+        d = sig["signal_date"]
+        if d not in signals_by_date:
+            signals_by_date[d] = []
+        signals_by_date[d].append(sig)
+
+    # Sort each date's signals by composite score (descending)
+    for d in signals_by_date:
+        signals_by_date[d].sort(key=lambda s: s["composite_score"], reverse=True)
+
+    # Simulation
+    open_positions: List[OpenPosition] = []
+    portfolio_value = 1.0  # Start with $1
+    cost_per_leg = config.transaction_cost_bps / 10000
+
+    def get_next_trading_day(d: date) -> Optional[date]:
+        """Get the next trading day after date d."""
+        for td in trading_dates:
+            if td > d:
+                return td
+        return None
+
+    def get_price(ticker: str, d: date, field: str = "close") -> Optional[float]:
+        """Get price for ticker on date d."""
+        if ticker not in prices_dict:
+            return None
+        df = prices_dict[ticker]
+        row = df[df["date"] == d]
+        if row.empty:
+            return None
+        return float(row.iloc[0][field])
+
+    for current_date in trading_dates:
+        # 1. Close positions that have reached their exit date
+        positions_to_close = [p for p in open_positions if current_date >= p.target_exit_date]
+        for pos in positions_to_close:
+            exit_price = get_price(pos.ticker, current_date, "close")
+            if exit_price is None:
+                # Try next few days
+                for offset in range(1, 5):
+                    next_d = get_next_trading_day(current_date)
+                    if next_d:
+                        exit_price = get_price(pos.ticker, next_d, "close")
+                        if exit_price:
+                            break
+
+            if exit_price is None:
+                exit_price = pos.entry_price  # No data = flat
+
+            # Short return = (entry - exit) / entry - transaction costs
+            raw_return = (pos.entry_price - exit_price) / pos.entry_price
+            net_return = raw_return - 2 * cost_per_leg  # Entry + exit costs
+
+            trade = Trade(
+                filing_id=pos.filing_id,
+                ticker=pos.ticker,
+                signal_date=pos.signal_date,
+                entry_date=pos.entry_date,
+                exit_date=current_date,
+                entry_price=pos.entry_price,
+                exit_price=exit_price,
+                return_pct=net_return,
+                hold_days=(current_date - pos.entry_date).days,
+            )
+
+            # LOOK-AHEAD GUARD
+            assert trade.entry_date > trade.signal_date, (
+                f"Look-ahead bias: entry {trade.entry_date} <= signal {trade.signal_date}"
+            )
+
+            result.trades.append(trade)
+            open_positions.remove(pos)
+
+        # 2. Check for new signals on the PREVIOUS day (signals fire end-of-day)
+        # We check yesterday's signals and enter TODAY at open
+        prev_date = None
+        idx = trading_dates.index(current_date)
+        if idx > 0:
+            prev_date = trading_dates[idx - 1]
+
+        if prev_date and prev_date in signals_by_date:
+            new_signals = signals_by_date[prev_date]
+            for sig in new_signals:
+                if len(open_positions) >= config.max_positions:
+                    break
+
+                ticker = sig["ticker"]
+                entry_price = get_price(ticker, current_date, "open")
+                if entry_price is None or entry_price <= 0:
+                    continue
+
+                # Already have a position in this ticker?
+                if any(p.ticker == ticker for p in open_positions):
+                    continue
+
+                # Compute exit date
+                target_exit = current_date
+                days_added = 0
+                for td in trading_dates:
+                    if td > current_date:
+                        days_added += 1
+                        if days_added >= config.hold_days:
+                            target_exit = td
+                            break
+                else:
+                    target_exit = current_date + timedelta(days=config.hold_days * 2)
+
+                pos = OpenPosition(
+                    filing_id=int(sig["filing_id"]),
+                    ticker=ticker,
+                    signal_date=prev_date,
+                    entry_date=current_date,
+                    target_exit_date=target_exit,
+                    entry_price=entry_price,
+                )
+
+                open_positions.append(pos)
+
+        # 3. Compute portfolio value
+        daily_pnl = 0.0
+        n_positions = len(open_positions)
+
+        if n_positions > 0:
+            weight = 1.0 / n_positions
+            for pos in open_positions:
+                current_price = get_price(pos.ticker, current_date, "close")
+                if current_price is not None:
+                    pos_return = (pos.entry_price - current_price) / pos.entry_price
+                    daily_pnl += weight * pos_return
+
+        # This is a simplified MTM — use running portfolio value
+        if n_positions > 0:
+            # Recompute portfolio value from scratch based on current positions
+            total_return = 0.0
+            for pos in open_positions:
+                current_price = get_price(pos.ticker, current_date, "close")
+                if current_price is not None:
+                    pos_return = (pos.entry_price - current_price) / pos.entry_price
+                    total_return += pos_return / n_positions
+
+            # Scale to initial capital + accumulated realized PnL
+            realized = sum(t.return_pct for t in result.trades) / max(len(result.trades), 1)
+
+        result.equity_curve.append({
+            "date": current_date.isoformat(),
+            "value": round(portfolio_value * (1 + daily_pnl), 6),
+            "n_positions": n_positions,
+        })
+
+    # Close any remaining open positions at last available price
+    last_date = trading_dates[-1] if trading_dates else None
+    for pos in open_positions:
+        exit_price = get_price(pos.ticker, last_date, "close") if last_date else pos.entry_price
+        if exit_price is None:
+            exit_price = pos.entry_price
+
+        raw_return = (pos.entry_price - exit_price) / pos.entry_price
+        net_return = raw_return - 2 * cost_per_leg
+
+        result.trades.append(Trade(
+            filing_id=pos.filing_id,
+            ticker=pos.ticker,
+            signal_date=pos.signal_date,
+            entry_date=pos.entry_date,
+            exit_date=last_date or pos.entry_date,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            return_pct=net_return,
+            hold_days=(last_date - pos.entry_date).days if last_date else 0,
+        ))
+
+    return result
