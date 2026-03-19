@@ -209,4 +209,81 @@ def compute_full_statistics(
     # Alpha decay
     output["alpha_decay"] = compute_alpha_decay(car_timeseries_list)
 
+    # Sub-sample analysis — targeted subsets where the signal should be strongest
+    output["subsample"] = compute_subsample_analysis(results_df)
+
     return output
+
+
+def compute_subsample_analysis(df: pd.DataFrame) -> Dict[str, Dict]:
+    """Compute CAR statistics for targeted sub-samples.
+
+    These sub-samples test the market microstructure thesis:
+    the signal should be strongest where analyst coverage is thinnest.
+    """
+    subsamples = {}
+
+    # Micro + Small cap only (thinnest coverage)
+    if "market_cap_bucket" in df.columns:
+        micro_small = df[df["market_cap_bucket"].isin(["micro", "small"])]
+        if len(micro_small) >= 5:
+            subsamples["Micro + Small Cap"] = {
+                "filter": "market_cap_bucket in [micro, small]",
+                "n_events": len(micro_small),
+                **{w: compute_car_statistics(micro_small[w].dropna().tolist())
+                   for w in ["car_post30", "car_post60", "car_post90"]
+                   if w in micro_small.columns},
+            }
+
+    # Exclude mega-cap (where signal is noise)
+    if "market_cap_bucket" in df.columns:
+        no_mega = df[df["market_cap_bucket"] != "mega"]
+        if len(no_mega) >= 10:
+            subsamples["Exclude Mega-Cap"] = {
+                "filter": "market_cap_bucket != mega",
+                "n_events": len(no_mega),
+                **{w: compute_car_statistics(no_mega[w].dropna().tolist())
+                   for w in ["car_post30", "car_post60", "car_post90"]
+                   if w in no_mega.columns},
+            }
+
+    # Exclude Technology sector (where layoffs are often bullish)
+    if "sector" in df.columns:
+        no_tech = df[~df["sector"].isin(["Technology", "Information Technology"])]
+        if len(no_tech) >= 10:
+            subsamples["Exclude Technology"] = {
+                "filter": "sector != Technology",
+                "n_events": len(no_tech),
+                **{w: compute_car_statistics(no_tech[w].dropna().tolist())
+                   for w in ["car_post30", "car_post60", "car_post90"]
+                   if w in no_tech.columns},
+            }
+
+    # Healthcare only (strongest signal in current data)
+    if "sector" in df.columns:
+        healthcare = df[df["sector"].isin(["Healthcare", "Health Care"])]
+        if len(healthcare) >= 5:
+            subsamples["Healthcare Only"] = {
+                "filter": "sector in [Healthcare]",
+                "n_events": len(healthcare),
+                **{w: compute_car_statistics(healthcare[w].dropna().tolist())
+                   for w in ["car_post30", "car_post60", "car_post90"]
+                   if w in healthcare.columns},
+            }
+
+    # Exclude mega-cap AND tech (cleanest signal)
+    if "market_cap_bucket" in df.columns and "sector" in df.columns:
+        clean = df[
+            (df["market_cap_bucket"] != "mega") &
+            (~df["sector"].isin(["Technology", "Information Technology"]))
+        ]
+        if len(clean) >= 10:
+            subsamples["Excl Mega-Cap + Tech"] = {
+                "filter": "market_cap_bucket != mega AND sector != Technology",
+                "n_events": len(clean),
+                **{w: compute_car_statistics(clean[w].dropna().tolist())
+                   for w in ["car_post30", "car_post60", "car_post90"]
+                   if w in clean.columns},
+            }
+
+    return subsamples
