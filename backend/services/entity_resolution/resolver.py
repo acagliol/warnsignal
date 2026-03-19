@@ -90,20 +90,51 @@ class EntityResolver:
                     logger.info(f"Fuzzy match: '{company_name_raw}' -> {ticker} (score={score:.1f})")
                     return result
 
-        # Step 3: SEC EDGAR fallback
+        # Step 3: SEC EDGAR fallback — no longer gated by SP1500 membership
+        # Any publicly traded company with a valid ticker is useful for the event study
         sec_result = self.sec_client.search_company(company_name_raw)
         if sec_result:
             ticker, cik = sec_result
-            if self.sp1500.ticker_exists(ticker):
-                result.update({
-                    "ticker": ticker,
-                    "company_name_matched": company_name_raw,
-                    "match_method": "sec_edgar",
-                    "match_score": 75.0,  # Lower confidence for EDGAR-only matches
-                    "cik": cik,
-                })
-                logger.info(f"SEC EDGAR match: '{company_name_raw}' -> {ticker} (CIK={cik})")
-                return result
+            # Check if we know sector/cap from SP1500
+            sp_info = self.sp1500.lookup_by_ticker(ticker) if hasattr(self.sp1500, 'lookup_by_ticker') else None
+            sector = sp_info[1] if sp_info else None
+            mcap = sp_info[2] if sp_info else None
+
+            result.update({
+                "ticker": ticker,
+                "company_name_matched": company_name_raw,
+                "match_method": "sec_edgar",
+                "match_score": 80.0,
+                "cik": cik,
+                "sector": sector,
+                "market_cap_bucket": get_market_cap_bucket(mcap) if mcap else None,
+            })
+            logger.info(f"SEC EDGAR match: '{company_name_raw}' -> {ticker} (CIK={cik})")
+            return result
+
+        # Step 4: Token-based first-word match (catches "Amazon" from "Amazon.com Services LLC")
+        first_word = normalized.split()[0] if normalized else ""
+        if len(first_word) >= 4:
+            token_match = process.extractOne(
+                first_word,
+                self.sp1500.names,
+                scorer=fuzz.partial_ratio,
+            )
+            if token_match and token_match[1] >= 90:
+                matched_name = token_match[0]
+                lookup = self.sp1500.lookup(matched_name)
+                if lookup:
+                    ticker, sector, mcap = lookup
+                    result.update({
+                        "ticker": ticker,
+                        "company_name_matched": matched_name,
+                        "match_method": "token_match",
+                        "match_score": token_match[1] * 0.85,  # Discount for partial match
+                        "sector": sector,
+                        "market_cap_bucket": get_market_cap_bucket(mcap),
+                    })
+                    logger.info(f"Token match: '{company_name_raw}' -> {ticker} (score={token_match[1]:.1f})")
+                    return result
 
         # No match found
         logger.debug(f"No match found for: '{company_name_raw}'")

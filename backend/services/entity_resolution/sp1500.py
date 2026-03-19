@@ -153,6 +153,14 @@ class SP1500Index:
     def ticker_exists(self, ticker: str) -> bool:
         return ticker.upper() in self._tickers
 
+    def lookup_by_ticker(self, ticker: str) -> Optional[Tuple[str, Optional[str], Optional[float]]]:
+        """Look up by ticker. Returns (ticker, sector, market_cap) or None."""
+        name = self._tickers.get(ticker.upper())
+        if name:
+            norm = normalize_company_name(name)
+            return self._names.get(norm)
+        return None
+
     def get_sector_etf(self, sector: Optional[str]) -> str:
         """Get the sector ETF ticker for benchmarking. Defaults to SPY."""
         if sector is None:
