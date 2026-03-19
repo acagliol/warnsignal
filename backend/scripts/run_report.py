@@ -64,12 +64,31 @@ def run():
     equity_curve = []
 
     if bt_run:
+        # Load trades for avg_return calculation
+        trades = db.query(BacktestTrade).filter(BacktestTrade.run_id == bt_run.id).order_by(BacktestTrade.entry_date).all()
+        avg_return = None
+        if trades:
+            avg_return = sum(t.return_pct for t in trades) / len(trades)
+
+            # Reconstruct equity curve from trades if not stored
+            # Group trades by entry date and compute cumulative returns
+            trade_dates = sorted(set(t.entry_date for t in trades))
+            if trade_dates:
+                portfolio_value = 1.0
+                for t in trades:
+                    portfolio_value *= (1 + t.return_pct / bt_run.n_trades)
+                    equity_curve.append({
+                        "date": t.exit_date.isoformat() if t.exit_date else t.entry_date.isoformat(),
+                        "value": round(portfolio_value, 6),
+                    })
+
         backtest_metrics = {
             "sharpe_ratio": bt_run.sharpe_ratio,
             "max_drawdown": bt_run.max_drawdown,
             "total_return": bt_run.total_return,
             "win_rate": bt_run.win_rate,
             "n_trades": bt_run.n_trades,
+            "avg_return": avg_return,
         }
 
     db.close()
