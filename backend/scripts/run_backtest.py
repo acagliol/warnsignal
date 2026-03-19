@@ -135,40 +135,91 @@ def run():
                 for p in price_rows
             ])
 
-    # Run backtest
-    config = BacktestConfig(
+    # ----------------------------------------------------------------
+    # Run 1: Full Sample Short (all signals, short-only)
+    # ----------------------------------------------------------------
+    config_full = BacktestConfig(
         hold_days=settings.BACKTEST_DEFAULT_HOLD_DAYS,
         max_positions=settings.BACKTEST_MAX_POSITIONS,
     )
 
-    logger.info(f"Running backtest: hold={config.hold_days}d, max_pos={config.max_positions}")
-    result = run_backtest(signals_df, prices_dict, config)
-    metrics = compute_metrics(result.trades, result.equity_curve)
+    logger.info(f"Running backtest [Full Sample]: hold={config_full.hold_days}d, max_pos={config_full.max_positions}")
+    result_full = run_backtest(signals_df, prices_dict, config_full)
+    metrics_full = compute_metrics(result_full.trades, result_full.equity_curve)
 
-    # Store backtest results
-    bt_run = BacktestRun(
-        run_name="WARN Short Signal v1",
+    # Store full-sample backtest results
+    bt_run_full = BacktestRun(
+        run_name="WARN Short Signal v1 -- Full Sample",
         start_date=signals_df["signal_date"].min(),
         end_date=signals_df["signal_date"].max(),
         config=json.dumps({
-            "hold_days": config.hold_days,
-            "max_positions": config.max_positions,
-            "min_score": config.min_score,
-            "transaction_cost_bps": config.transaction_cost_bps,
+            "hold_days": config_full.hold_days,
+            "max_positions": config_full.max_positions,
+            "min_score": config_full.min_score,
+            "transaction_cost_bps": config_full.transaction_cost_bps,
+            "cap_filter": None,
         }),
-        sharpe_ratio=metrics.get("sharpe_ratio"),
-        max_drawdown=metrics.get("max_drawdown"),
-        total_return=metrics.get("total_return"),
-        win_rate=metrics.get("win_rate"),
-        n_trades=metrics.get("n_trades"),
+        sharpe_ratio=metrics_full.get("sharpe_ratio"),
+        max_drawdown=metrics_full.get("max_drawdown"),
+        total_return=metrics_full.get("total_return"),
+        win_rate=metrics_full.get("win_rate"),
+        n_trades=metrics_full.get("n_trades"),
     )
-    db.add(bt_run)
+    db.add(bt_run_full)
     db.commit()
 
-    # Store trades
-    for trade in result.trades:
+    for trade in result_full.trades:
         bt_trade = BacktestTrade(
-            run_id=bt_run.id,
+            run_id=bt_run_full.id,
+            filing_id=trade.filing_id,
+            ticker=trade.ticker,
+            entry_date=trade.entry_date,
+            exit_date=trade.exit_date,
+            entry_price=trade.entry_price,
+            exit_price=trade.exit_price,
+            return_pct=trade.return_pct,
+            hold_days=trade.hold_days,
+        )
+        db.add(bt_trade)
+    db.commit()
+
+    # ----------------------------------------------------------------
+    # Run 2: Micro+Small Cap Short (filtered by market_cap_bucket)
+    # ----------------------------------------------------------------
+    config_small = BacktestConfig(
+        hold_days=settings.BACKTEST_DEFAULT_HOLD_DAYS,
+        max_positions=settings.BACKTEST_MAX_POSITIONS,
+        cap_filter=["micro", "small"],
+    )
+
+    logger.info(f"Running backtest [Micro+Small Cap]: hold={config_small.hold_days}d, max_pos={config_small.max_positions}")
+    result_small = run_backtest(signals_df, prices_dict, config_small)
+    metrics_small = compute_metrics(result_small.trades, result_small.equity_curve)
+
+    # Store micro+small backtest results
+    bt_run_small = BacktestRun(
+        run_name="WARN Short Signal v1 -- Micro+Small Cap",
+        start_date=signals_df["signal_date"].min(),
+        end_date=signals_df["signal_date"].max(),
+        config=json.dumps({
+            "hold_days": config_small.hold_days,
+            "max_positions": config_small.max_positions,
+            "min_score": config_small.min_score,
+            "transaction_cost_bps": config_small.transaction_cost_bps,
+            "cap_filter": ["micro", "small"],
+        }),
+        sharpe_ratio=metrics_small.get("sharpe_ratio"),
+        max_drawdown=metrics_small.get("max_drawdown"),
+        total_return=metrics_small.get("total_return"),
+        win_rate=metrics_small.get("win_rate"),
+        n_trades=metrics_small.get("n_trades"),
+    )
+    db.add(bt_run_small)
+    db.commit()
+
+    for trade in result_small.trades:
+        bt_trade = BacktestTrade(
+            run_id=bt_run_small.id,
             filing_id=trade.filing_id,
             ticker=trade.ticker,
             entry_date=trade.entry_date,
@@ -184,16 +235,20 @@ def run():
     db.close()
 
     # Print results
-    print("\n" + "=" * 60)
-    print("WARN SIGNAL BACKTEST RESULTS")
-    print("=" * 60)
-    print(f"Sharpe Ratio:     {metrics.get('sharpe_ratio', 'N/A')}")
-    print(f"Max Drawdown:     {metrics.get('max_drawdown', 'N/A')}")
-    print(f"Total Return:     {metrics.get('total_return', 'N/A')}")
-    print(f"Win Rate:         {metrics.get('win_rate', 'N/A')}")
-    print(f"Number of Trades: {metrics.get('n_trades', 'N/A')}")
-    print(f"Avg Return/Trade: {metrics.get('avg_return', 'N/A')}")
-    print("=" * 60)
+    def _print_results(label, metrics):
+        print(f"\n{'=' * 60}")
+        print(f"  {label}")
+        print(f"{'=' * 60}")
+        print(f"  Sharpe Ratio:     {metrics.get('sharpe_ratio', 'N/A')}")
+        print(f"  Max Drawdown:     {metrics.get('max_drawdown', 'N/A')}")
+        print(f"  Total Return:     {metrics.get('total_return', 'N/A')}")
+        print(f"  Win Rate:         {metrics.get('win_rate', 'N/A')}")
+        print(f"  Number of Trades: {metrics.get('n_trades', 'N/A')}")
+        print(f"  Avg Return/Trade: {metrics.get('avg_return', 'N/A')}")
+        print(f"{'=' * 60}")
+
+    _print_results("FULL SAMPLE SHORT (all signals)", metrics_full)
+    _print_results("MICRO+SMALL CAP SHORT (filtered)", metrics_small)
 
 
 if __name__ == "__main__":
