@@ -39,6 +39,7 @@ class BacktestConfig:
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     transaction_cost_bps: float = 10.0  # 10 bps per leg
+    cap_filter: Optional[List[str]] = None  # e.g. ["micro", "small"]
 
 
 @dataclass
@@ -96,6 +97,15 @@ def run_backtest(
 
     # Filter signals by score threshold
     signals = signals_df[signals_df["composite_score"] >= config.min_score].copy()
+
+    # Filter by market cap bucket if specified
+    if config.cap_filter:
+        cap_lower = [c.lower() for c in config.cap_filter]
+        signals = signals[
+            signals["market_cap_bucket"].str.lower().isin(cap_lower)
+        ].copy()
+        logger.info(f"Cap filter {config.cap_filter}: {len(signals)} signals remain")
+
     signals = signals.sort_values("signal_date")
 
     if config.start_date:
@@ -198,7 +208,7 @@ def run_backtest(
         if idx > 0:
             prev_date = trading_dates[idx - 1]
 
-        if prev_date and prev_date in signals_by_date:
+        if prev_date and prev_date in signals_by_date and portfolio_value > 0.01:
             new_signals = signals_by_date[prev_date]
             for sig in new_signals:
                 if len(open_positions) >= config.max_positions:
@@ -236,34 +246,37 @@ def run_backtest(
 
                 open_positions.append(pos)
 
-        # 3. Compute portfolio value
-        daily_pnl = 0.0
+        # 3. Compute daily portfolio return and update cumulative value
         n_positions = len(open_positions)
+        daily_return = 0.0
 
         if n_positions > 0:
             weight = 1.0 / n_positions
             for pos in open_positions:
                 current_price = get_price(pos.ticker, current_date, "close")
                 if current_price is not None:
-                    pos_return = (pos.entry_price - current_price) / pos.entry_price
-                    daily_pnl += weight * pos_return
+                    # Get previous day price for day-over-day return
+                    prev_price = None
+                    if idx > 0:
+                        prev_price = get_price(pos.ticker, trading_dates[idx - 1], "close")
+                    if prev_price is None:
+                        prev_price = pos.entry_price
 
-        # This is a simplified MTM — use running portfolio value
-        if n_positions > 0:
-            # Recompute portfolio value from scratch based on current positions
-            total_return = 0.0
-            for pos in open_positions:
-                current_price = get_price(pos.ticker, current_date, "close")
-                if current_price is not None:
-                    pos_return = (pos.entry_price - current_price) / pos.entry_price
-                    total_return += pos_return / n_positions
+                    # Short return: price going down = positive return
+                    if prev_price > 0:
+                        day_ret = (prev_price - current_price) / prev_price
+                        daily_return += weight * day_ret
 
-            # Scale to initial capital + accumulated realized PnL
-            realized = sum(t.return_pct for t in result.trades) / max(len(result.trades), 1)
+            # Update cumulative portfolio value
+            portfolio_value *= (1 + daily_return)
+            # Liquidation floor: if portfolio is effectively wiped out, stop trading
+            if portfolio_value < 0.01:
+                portfolio_value = 0.01
+                logger.warning(f"Portfolio liquidated on {current_date}, stopping new entries")
 
         result.equity_curve.append({
             "date": current_date.isoformat(),
-            "value": round(portfolio_value * (1 + daily_pnl), 6),
+            "value": round(portfolio_value, 6),
             "n_positions": n_positions,
         })
 
