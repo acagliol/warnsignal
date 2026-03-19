@@ -4,17 +4,29 @@ Event-driven research signal using WARN Act layoff filings as a leading distress
 
 ## Key Results
 
-| Metric | [0, +30] | [0, +60] | [0, +90] |
-|--------|----------|----------|----------|
-| **Mean CAR** | -2.66% | -2.77% | -3.06% |
-| **t-statistic** | -1.14 | -0.90 | -1.02 |
-| **p-value** | 0.255 | 0.371 | 0.309 |
-| **% Events Negative** | 46.6% | 48.2% | 51.4% |
-| **95% CI** | [-7.2%, +1.9%] | [-8.8%, +3.3%] | [-9.0%, +2.8%] |
+### Full Sample (N = 1,153 events, 413 unique tickers)
 
-**N = 251 events** across 108 unique tickers. Backtest (30-day hold, top quintile short): **Sharpe 0.25**, Max DD 53.5%, Win Rate 41.5%, 118 trades.
+| Metric | [-30, 0] | [0, +30] | [0, +60] | [0, +90] |
+|--------|----------|----------|----------|----------|
+| **Mean CAR** | -11.19% | +3.69% | +4.52% | +5.97% |
+| **t-statistic** | -13.75 | 4.62 | 4.50 | 5.40 |
+| **p-value** | <0.0001 | <0.0001 | <0.0001 | <0.0001 |
+| **95% CI** | [-12.8%, -9.6%] | [+2.1%, +5.3%] | [+2.6%, +6.5%] | [+3.8%, +8.1%] |
 
-The overall signal shows directionally negative CARs but does **not** reach conventional significance (p < 0.05) in the full cross-section. However, the signal is **statistically significant in micro-caps** (CAR = -23.2%, p = 0.037) and **Healthcare** (CAR = -10.8%, p < 0.05). It is weak or inverted in Technology (+6.3%) and mega-caps (+4.0%). This is consistent with the market microstructure thesis — the signal works where coverage is thin.
+### The Key Finding: Signal Inversion by Market Cap
+
+The overall post-filing CAR is **positive** -- stocks bounce after WARN filings. But the signal splits cleanly by market cap:
+
+| Sub-Sample | N | Mean CAR [0,+30] | t-stat | p-value |
+|------------|---|-------------------|--------|---------|
+| **Full Sample** | 1,153 | +3.69% | 4.62 | <0.0001 |
+| **Micro + Small Cap** | 308 | **-5.31%** | -2.02 | **0.044** |
+| **Large Cap** | 517 | +7.49% | 5.86 | <0.0001 |
+| **Healthcare Only** | 385 | +2.16% | 1.50 | 0.134 |
+
+**Micro/small-cap backtest** (30-day hold, short-only): **Sharpe 0.50**, Win Rate 59.0%, Avg Return/Trade +3.98%, 134 trades.
+
+The distress signal works where coverage is thin: micro/small-cap stocks with WARN filings show statistically significant negative CARs (p < 0.05). Large/mid-cap filings are inverted -- the market reads layoffs as cost-cutting positives and bids the stock up, consistent with the market microstructure thesis.
 
 ## Hypothesis
 
@@ -74,10 +86,12 @@ This is honest about where the signal breaks:
 
 The signal does **not** work uniformly:
 
-- **Utilities/REITs**: Low CAR magnitude — these sectors have regulated workforces and layoffs are less correlated with financial distress
-- **Large-cap tech**: Layoffs at GOOGL, META, AMZN in 2022-23 were followed by rallies, not declines — the market read these as margin-improving restructuring
-- **Short holding periods (<10 days)**: Alpha decay analysis shows minimal signal in the first week — the market needs time to reprice
-- **Bull markets**: During strong risk-on environments, even distressed names get lifted by beta
+- **Large/mid-cap stocks**: CARs are significantly positive (+7.4%). WARN filings for well-covered companies signal cost-cutting restructuring, not distress. The market bids these up.
+- **Every sector individually**: No single sector shows significant negative CARs. Basic Materials (+14.2%), Communication Services (+7.4%), and Technology (+5.7%) are the most inverted.
+- **Short holding periods (<10 days)**: Alpha decay analysis shows minimal signal in the first week -- the market needs time to reprice.
+- **Bull markets**: During strong risk-on environments, even distressed names get lifted by beta.
+- **Borrow costs**: The signal is strongest in micro/small caps, where short-selling borrow fees are highest and often eat the alpha.
+- **Statistical power**: The micro/small-cap subset (N=308) has marginal significance (p=0.044). More data would strengthen or invalidate the finding.
 
 ## Stack
 
