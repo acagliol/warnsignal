@@ -14,7 +14,7 @@ class TXScraper(BaseScraper):
     STATE = "TX"
     BASE_URL = "https://twc.texas.gov/data-reports/warn-notice"
     EXCEL_BASE = "https://twc.texas.gov/sites/default/files/oei/docs"
-    YEARS = [2026, 2025, 2024, 2023]
+    YEARS = [2026, 2025, 2024, 2023, 2022, 2021, 2020]
 
     def __init__(self, delay_seconds: float = 2.0):
         super().__init__(delay_seconds)
