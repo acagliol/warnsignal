@@ -5,6 +5,8 @@ Design principles:
 - Equal weight across open positions
 - Configurable holding period and max concurrent positions
 - Short-only for WARN distress signals
+- Optional borrow cost modeling, variable transaction costs, stop-loss,
+  publication lag, and short-selling filters
 """
 
 import logging
@@ -41,6 +43,36 @@ class BacktestConfig:
     transaction_cost_bps: float = 10.0  # 10 bps per leg
     cap_filter: Optional[List[str]] = None  # e.g. ["micro", "small"]
 
+    # Borrow cost modeling
+    borrow_cost_schedule: Dict[str, float] = field(default_factory=lambda: {
+        "mega": 25.0,    # 25 bps annualized
+        "large": 25.0,   # 25 bps annualized
+        "mid": 50.0,     # 50 bps annualized
+        "small": 100.0,  # 100 bps annualized
+        "micro": 300.0,  # 300 bps annualized (hard to borrow)
+    })
+    use_borrow_costs: bool = False
+
+    # Variable transaction costs by market cap
+    variable_cost_schedule: Dict[str, float] = field(default_factory=lambda: {
+        "mega": 5.0,     # 5 bps per leg
+        "large": 5.0,
+        "mid": 10.0,
+        "small": 25.0,
+        "micro": 50.0,
+    })
+    use_variable_costs: bool = False
+
+    # Stop-loss (short position): close if stock rises by this fraction
+    stop_loss_pct: Optional[float] = None  # e.g., 0.20 for 20% stop
+
+    # Publication lag: simulate filing -> publication delay
+    publication_lag_days: int = 0
+
+    # Short-selling filters
+    min_price: float = 0.0       # Minimum stock price to enter short
+    min_avg_volume: float = 0.0  # Minimum 20-day average daily volume
+
 
 @dataclass
 class OpenPosition:
@@ -50,6 +82,7 @@ class OpenPosition:
     entry_date: date
     target_exit_date: date
     entry_price: float
+    market_cap_bucket: Optional[str] = None
 
 
 @dataclass
@@ -83,8 +116,10 @@ def run_backtest(
 
     Args:
         signals_df: DataFrame with columns:
-            filing_id, ticker, signal_date, composite_score, sector
-        prices_dict: Dict of ticker -> DataFrame with 'date', 'open', 'close'
+            filing_id, ticker, signal_date, composite_score, sector,
+            market_cap_bucket (optional)
+        prices_dict: Dict of ticker -> DataFrame with 'date', 'open', 'close',
+            and optionally 'volume'
         config: Backtest configuration
 
     Returns:
@@ -105,6 +140,16 @@ def run_backtest(
             signals["market_cap_bucket"].str.lower().isin(cap_lower)
         ].copy()
         logger.info(f"Cap filter {config.cap_filter}: {len(signals)} signals remain")
+
+    # Apply publication lag: shift signal_date forward
+    if config.publication_lag_days > 0:
+        signals["signal_date"] = signals["signal_date"] + timedelta(
+            days=config.publication_lag_days
+        )
+        logger.info(
+            f"Publication lag: shifted signal_date forward by "
+            f"{config.publication_lag_days} calendar days"
+        )
 
     signals = signals.sort_values("signal_date")
 
@@ -141,7 +186,6 @@ def run_backtest(
     # Simulation
     open_positions: List[OpenPosition] = []
     portfolio_value = 1.0  # Start with $1
-    cost_per_leg = config.transaction_cost_bps / 10000
 
     def get_next_trading_day(d: date) -> Optional[date]:
         """Get the next trading day after date d."""
@@ -150,7 +194,7 @@ def run_backtest(
                 return td
         return None
 
-    def get_price(ticker: str, d: date, field: str = "close") -> Optional[float]:
+    def get_price(ticker: str, d: date, price_field: str = "close") -> Optional[float]:
         """Get price for ticker on date d."""
         if ticker not in prices_dict:
             return None
@@ -158,10 +202,74 @@ def run_backtest(
         row = df[df["date"] == d]
         if row.empty:
             return None
-        return float(row.iloc[0][field])
+        return float(row.iloc[0][price_field])
 
-    for current_date in trading_dates:
-        # 1. Close positions that have reached their exit date
+    def get_avg_volume(ticker: str, as_of_date: date, lookback: int = 20) -> float:
+        """Compute average daily volume over the last `lookback` trading days."""
+        if ticker not in prices_dict:
+            return 0.0
+        df = prices_dict[ticker]
+        if "volume" not in df.columns:
+            return 0.0
+        hist = df[df["date"] <= as_of_date].sort_values("date").tail(lookback)
+        if hist.empty or hist["volume"].isna().all():
+            return 0.0
+        return float(hist["volume"].mean())
+
+    def _compute_cost_per_leg(pos: OpenPosition) -> float:
+        """Determine the per-leg transaction cost for a position."""
+        if config.use_variable_costs:
+            cap_bucket = pos.market_cap_bucket or "mid"
+            return config.variable_cost_schedule.get(cap_bucket, 10.0) / 10000
+        return config.transaction_cost_bps / 10000
+
+    def _close_position(pos: OpenPosition, exit_price: float, exit_date: date):
+        """Create a Trade from a closed position."""
+        raw_return = (pos.entry_price - exit_price) / pos.entry_price
+        cost_per_leg = _compute_cost_per_leg(pos)
+        net_return = raw_return - 2 * cost_per_leg  # Entry + exit costs
+
+        trade = Trade(
+            filing_id=pos.filing_id,
+            ticker=pos.ticker,
+            signal_date=pos.signal_date,
+            entry_date=pos.entry_date,
+            exit_date=exit_date,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            return_pct=net_return,
+            hold_days=(exit_date - pos.entry_date).days,
+        )
+
+        # LOOK-AHEAD GUARD
+        assert trade.entry_date > trade.signal_date, (
+            f"Look-ahead bias: entry {trade.entry_date} <= signal {trade.signal_date}"
+        )
+
+        return trade
+
+    for idx, current_date in enumerate(trading_dates):
+        # 1a. Stop-loss check: close positions where the stock has risen
+        #     beyond stop_loss_pct (short is losing money)
+        if config.stop_loss_pct is not None:
+            stopped_out = []
+            for pos in open_positions:
+                current_price = get_price(pos.ticker, current_date, "close")
+                if current_price is not None and pos.entry_price > 0:
+                    price_increase = (current_price - pos.entry_price) / pos.entry_price
+                    if price_increase >= config.stop_loss_pct:
+                        trade = _close_position(pos, current_price, current_date)
+                        result.trades.append(trade)
+                        stopped_out.append(pos)
+                        logger.debug(
+                            f"Stop-loss triggered for {pos.ticker} on {current_date}: "
+                            f"entry={pos.entry_price:.2f}, current={current_price:.2f}, "
+                            f"rise={price_increase:.1%}"
+                        )
+            for pos in stopped_out:
+                open_positions.remove(pos)
+
+        # 1b. Close positions that have reached their exit date
         positions_to_close = [p for p in open_positions if current_date >= p.target_exit_date]
         for pos in positions_to_close:
             exit_price = get_price(pos.ticker, current_date, "close")
@@ -177,34 +285,13 @@ def run_backtest(
             if exit_price is None:
                 exit_price = pos.entry_price  # No data = flat
 
-            # Short return = (entry - exit) / entry - transaction costs
-            raw_return = (pos.entry_price - exit_price) / pos.entry_price
-            net_return = raw_return - 2 * cost_per_leg  # Entry + exit costs
-
-            trade = Trade(
-                filing_id=pos.filing_id,
-                ticker=pos.ticker,
-                signal_date=pos.signal_date,
-                entry_date=pos.entry_date,
-                exit_date=current_date,
-                entry_price=pos.entry_price,
-                exit_price=exit_price,
-                return_pct=net_return,
-                hold_days=(current_date - pos.entry_date).days,
-            )
-
-            # LOOK-AHEAD GUARD
-            assert trade.entry_date > trade.signal_date, (
-                f"Look-ahead bias: entry {trade.entry_date} <= signal {trade.signal_date}"
-            )
-
+            trade = _close_position(pos, exit_price, current_date)
             result.trades.append(trade)
             open_positions.remove(pos)
 
         # 2. Check for new signals on the PREVIOUS day (signals fire end-of-day)
         # We check yesterday's signals and enter TODAY at open
         prev_date = None
-        idx = trading_dates.index(current_date)
         if idx > 0:
             prev_date = trading_dates[idx - 1]
 
@@ -222,6 +309,21 @@ def run_backtest(
                 # Already have a position in this ticker?
                 if any(p.ticker == ticker for p in open_positions):
                     continue
+
+                # Short-selling filter: minimum price
+                if config.min_price > 0 and entry_price < config.min_price:
+                    continue
+
+                # Short-selling filter: minimum average volume
+                if config.min_avg_volume > 0:
+                    avg_vol = get_avg_volume(ticker, prev_date)
+                    if avg_vol < config.min_avg_volume:
+                        continue
+
+                # Determine market_cap_bucket for this signal
+                sig_cap_bucket = None
+                if "market_cap_bucket" in sig.index and pd.notna(sig["market_cap_bucket"]):
+                    sig_cap_bucket = str(sig["market_cap_bucket"]).lower()
 
                 # Compute exit date
                 target_exit = current_date
@@ -242,6 +344,7 @@ def run_backtest(
                     entry_date=current_date,
                     target_exit_date=target_exit,
                     entry_price=entry_price,
+                    market_cap_bucket=sig_cap_bucket,
                 )
 
                 open_positions.append(pos)
@@ -267,6 +370,13 @@ def run_backtest(
                         day_ret = (prev_price - current_price) / prev_price
                         daily_return += weight * day_ret
 
+                # Deduct daily borrow cost
+                if config.use_borrow_costs:
+                    cap_bucket = pos.market_cap_bucket or "mid"
+                    annual_bps = config.borrow_cost_schedule.get(cap_bucket, 50.0)
+                    daily_borrow_cost = annual_bps / 10000 / 252
+                    daily_return -= weight * daily_borrow_cost
+
             # Update cumulative portfolio value
             portfolio_value *= (1 + daily_return)
             # Liquidation floor: if portfolio is effectively wiped out, stop trading
@@ -287,19 +397,7 @@ def run_backtest(
         if exit_price is None:
             exit_price = pos.entry_price
 
-        raw_return = (pos.entry_price - exit_price) / pos.entry_price
-        net_return = raw_return - 2 * cost_per_leg
-
-        result.trades.append(Trade(
-            filing_id=pos.filing_id,
-            ticker=pos.ticker,
-            signal_date=pos.signal_date,
-            entry_date=pos.entry_date,
-            exit_date=last_date or pos.entry_date,
-            entry_price=pos.entry_price,
-            exit_price=exit_price,
-            return_pct=net_return,
-            hold_days=(last_date - pos.entry_date).days if last_date else 0,
-        ))
+        trade = _close_position(pos, exit_price, last_date or pos.entry_date)
+        result.trades.append(trade)
 
     return result
