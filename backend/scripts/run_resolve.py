@@ -12,6 +12,7 @@ from services.entity_resolution.resolver import EntityResolver
 from services.market_data.price_loader import get_company_info
 from services.entity_resolution.sp1500 import get_market_cap_bucket
 from config import settings
+from sqlalchemy import select
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -25,9 +26,9 @@ def run():
         sec_user_agent=settings.SEC_USER_AGENT,
     )
 
-    # Get unresolved filings
+    # Get unresolved filings (those without an entity_match row)
     resolved_ids = db.query(EntityMatch.filing_id).subquery()
-    unresolved = db.query(WarnFiling).filter(~WarnFiling.id.in_(resolved_ids)).all()
+    unresolved = db.query(WarnFiling).filter(~WarnFiling.id.in_(select(resolved_ids))).all()
 
     logger.info(f"Found {len(unresolved)} unresolved filings")
 
@@ -35,7 +36,8 @@ def run():
     unresolved_count = 0
     resolution_cache: dict = {}
     yfinance_cache: dict = {}
-    BATCH_SIZE = 200
+    batch: list = []
+    BATCH_SIZE = 50
 
     for i, filing in enumerate(unresolved):
         raw_name = filing.company_name_raw
@@ -58,6 +60,11 @@ def run():
 
             resolution_cache[raw_name] = result
 
+        # Check if this filing already has a match (double-safety)
+        existing = db.query(EntityMatch).filter(EntityMatch.filing_id == filing.id).first()
+        if existing:
+            continue
+
         match = EntityMatch(
             filing_id=filing.id,
             ticker=result["ticker"],
@@ -78,10 +85,18 @@ def run():
             unresolved_count += 1
 
         if (i + 1) % BATCH_SIZE == 0:
-            db.commit()
+            try:
+                db.commit()
+            except Exception as e:
+                logger.warning(f"Batch commit failed: {e}")
+                db.rollback()
             logger.info(f"Progress: {i+1}/{len(unresolved)} filings processed")
 
-    db.commit()
+    try:
+        db.commit()
+    except Exception as e:
+        logger.warning(f"Final commit failed: {e}")
+        db.rollback()
     db.close()
 
     logger.info(f"Resolution complete. Resolved: {resolved_count}, Unresolved: {unresolved_count}")
