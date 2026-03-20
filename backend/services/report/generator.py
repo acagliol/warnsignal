@@ -248,14 +248,27 @@ def _build_markdown(stats: Dict, backtest_metrics: Dict, anchor_results: Optiona
     md += "## Where It Breaks\n\n"
     md += "The signal does **not** work uniformly. Honest reporting of failure modes:\n\n"
 
-    md += "### Key Finding: Signal Inversion by Market Cap\n\n"
-    md += "The overall post-filing CAR [0, +30] is **positive** (+3.69%), meaning stocks on average "
-    md += "*bounce* after WARN filings -- the opposite of a distress short signal. This is driven by "
-    md += "mean reversion in large/mid-cap names where analyst coverage is dense and markets quickly "
-    md += "price in the layoff as a cost-cutting positive.\n\n"
-    md += "The key finding: WARN filings for micro/small-cap companies signal continued distress "
-    md += "(CAR = -5.31%, p < 0.05), while large-cap filings signal buying opportunities as markets "
-    md += "overreact then revert.\n\n"
+    md += "### Key Finding: Signal Inversion\n\n"
+    car30_mean = stats.get("car_post30", {}).get("mean")
+    pre30_mean = stats.get("car_pre30", {}).get("mean")
+    md += f"The overall post-filing CAR [0, +30] is **positive** ({_fmt_pct(car30_mean)}), meaning stocks on average "
+    md += "*bounce* after WARN filings -- the opposite of a distress short signal. "
+    if pre30_mean is not None:
+        md += f"Pre-filing CAR [-30, 0] is {_fmt_pct(pre30_mean)}, confirming distress is priced in BEFORE the filing. "
+    md += "The filing itself resolves uncertainty and triggers mean reversion.\n\n"
+
+    # Check sub-sample for micro+small
+    micro_small = stats.get("subsample", {}).get("Micro + Small Cap", {})
+    ms_car30 = micro_small.get("car_post30", {})
+    if ms_car30.get("mean") is not None:
+        ms_mean = ms_car30["mean"]
+        ms_p = ms_car30.get("p_value")
+        if ms_mean < 0 and ms_p and ms_p < 0.05:
+            md += f"Exception: micro/small-cap companies show continued distress (CAR = {_fmt_pct(ms_mean)}, p={_fmt_num(ms_p)}), "
+            md += "consistent with thin analyst coverage allowing information gaps to persist.\n\n"
+        else:
+            md += f"Even micro/small caps show positive or insignificant CARs ({_fmt_pct(ms_mean)}, p={_fmt_num(ms_p)}), "
+            md += "suggesting WARN filings are universally lagging indicators of already-priced distress.\n\n"
 
     # Analyze sector breakdown for weak/inverted sectors
     sector_bd = stats.get("sector_breakdown", {})
@@ -304,7 +317,7 @@ def _build_markdown(stats: Dict, backtest_metrics: Dict, anchor_results: Optiona
     md += "## Limitations\n\n"
     md += "- **Entity resolution**: Match confidence drops below 80% for private subsidiaries. "
     md += "Low-confidence matches (< 85 score) are excluded from the backtest.\n"
-    md += "- **State coverage**: Only 5 states scraped -- filings in other states are missed entirely.\n"
+    md += "- **State coverage**: 9 states scraped (TX, FL, VA, CA, IN, IL, CO, MD, NY) -- expanding toward full national coverage.\n"
     md += "- **Survivorship**: Delisted tickers are included but price data terminates at delisting, "
     md += "potentially understating full decline.\n"
     md += "- **Transaction costs**: 10 bps/leg assumed. Signal may not survive for micro-caps with wide spreads "
@@ -314,7 +327,7 @@ def _build_markdown(stats: Dict, backtest_metrics: Dict, anchor_results: Optiona
     md += "- **Cap filter dependency**: The signal only works for micro/small caps. "
     md += "This subset has fewer events, increasing sampling noise and reducing statistical power.\n"
     md += "- **Borrow costs**: Short-selling micro/small caps often incurs elevated borrow fees "
-    md += "(not modeled), which could erode or eliminate the -5.31% CAR advantage.\n"
+    md += "(not modeled), which would further reduce any exploitable signal.\n"
     md += "- **Sample size**: Minimum 50 events recommended for statistical validity. "
     n_events = stats.get("car_post30", {}).get("n_events", 0)
     if n_events < 50:
