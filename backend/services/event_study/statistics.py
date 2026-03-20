@@ -1,7 +1,9 @@
 """Statistical analysis for event study results.
 
 Computes cross-sectional statistics, breakdowns, and alpha decay curves
-across all WARN filing events.
+across all WARN filing events.  Includes bootstrap inference,
+multiple-testing corrections, non-parametric tests, and placebo
+(randomisation) tests for robustness.
 """
 
 import logging
@@ -15,6 +17,219 @@ logger = logging.getLogger(__name__)
 
 # Alpha decay evaluation windows (days after event)
 ALPHA_DECAY_WINDOWS = [5, 10, 15, 20, 30, 45, 60, 90]
+
+
+# ---------------------------------------------------------------------------
+# Advanced statistical helpers
+# ---------------------------------------------------------------------------
+
+def bootstrap_car_ci(
+    car_values: List[float],
+    n_bootstrap: int = 10000,
+    ci: float = 0.95,
+) -> Dict:
+    """Compute bootstrap confidence intervals for mean CAR.
+
+    More robust than normal-theory CI for skewed distributions.
+    Uses the percentile method: the CI bounds are the (alpha/2) and
+    (1 - alpha/2) percentiles of the bootstrap mean distribution.
+
+    Args:
+        car_values: Raw CAR values across events.
+        n_bootstrap: Number of bootstrap resamples.
+        ci: Confidence level (default 0.95 for a 95 % CI).
+
+    Returns:
+        {"mean": float, "ci_lower": float, "ci_upper": float,
+         "se_bootstrap": float}
+    """
+    arr = np.array([v for v in car_values if v is not None and not np.isnan(v)])
+
+    if len(arr) == 0:
+        return {"mean": None, "ci_lower": None, "ci_upper": None, "se_bootstrap": None}
+    if len(arr) == 1:
+        return {
+            "mean": float(arr[0]),
+            "ci_lower": float(arr[0]),
+            "ci_upper": float(arr[0]),
+            "se_bootstrap": 0.0,
+        }
+
+    rng = np.random.default_rng(seed=42)
+    # shape: (n_bootstrap, n_samples)
+    indices = rng.integers(0, len(arr), size=(n_bootstrap, len(arr)))
+    boot_means = arr[indices].mean(axis=1)
+
+    alpha = 1.0 - ci
+    lower = float(np.percentile(boot_means, 100 * alpha / 2))
+    upper = float(np.percentile(boot_means, 100 * (1 - alpha / 2)))
+
+    return {
+        "mean": float(np.mean(arr)),
+        "ci_lower": lower,
+        "ci_upper": upper,
+        "se_bootstrap": float(np.std(boot_means, ddof=1)),
+    }
+
+
+def correct_pvalues(p_values: List[float], method: str = "bh") -> List[float]:
+    """Apply multiple-testing correction to a list of p-values.
+
+    Methods:
+        "bonferroni": p_corrected = min(p * n_tests, 1.0)
+        "bh": Benjamini-Hochberg procedure controlling the False Discovery
+              Rate (FDR).
+
+    Args:
+        p_values: Raw (uncorrected) p-values.
+        method: "bonferroni" or "bh".
+
+    Returns:
+        List of corrected p-values in the same order as the input.
+    """
+    if not p_values:
+        return []
+
+    # Filter out None values, keeping track of positions
+    indexed = [(i, p) for i, p in enumerate(p_values) if p is not None]
+    if not indexed:
+        return [None] * len(p_values)  # type: ignore[list-item]
+
+    positions, raw = zip(*indexed)
+    raw = list(raw)
+    n = len(raw)
+
+    if method == "bonferroni":
+        corrected_vals = [min(p * n, 1.0) for p in raw]
+
+    elif method == "bh":
+        # Benjamini-Hochberg step-up procedure
+        order = np.argsort(raw)
+        corrected_vals = [0.0] * n
+        cum_min = 1.0
+        for rank_from_end, idx in enumerate(reversed(order)):
+            rank = n - rank_from_end  # 1-based rank
+            adj = raw[idx] * n / rank
+            cum_min = min(cum_min, adj)
+            corrected_vals[idx] = min(cum_min, 1.0)
+    else:
+        raise ValueError(f"Unknown correction method: {method!r}. Use 'bonferroni' or 'bh'.")
+
+    # Re-insert into original positions (preserving None slots)
+    result: List[Optional[float]] = [None] * len(p_values)
+    for pos, val in zip(positions, corrected_vals):
+        result[pos] = float(val)
+    return result  # type: ignore[return-value]
+
+
+def compute_nonparametric_tests(car_values: List[float]) -> Dict:
+    """Run non-parametric significance tests on CAR values.
+
+    Returns:
+        - wilcoxon_stat, wilcoxon_p: Wilcoxon signed-rank test (H0: median = 0)
+        - sign_test_p: Binomial sign test (H0: fraction negative <= 50 %)
+        - skewness, kurtosis: Distribution shape descriptors
+    """
+    arr = np.array([v for v in car_values if v is not None and not np.isnan(v)])
+
+    empty_result: Dict = {
+        "wilcoxon_stat": None,
+        "wilcoxon_p": None,
+        "sign_test_p": None,
+        "skewness": None,
+        "kurtosis": None,
+    }
+
+    if len(arr) < 2:
+        return empty_result
+
+    # Skewness and kurtosis (Fisher definition, excess kurtosis)
+    skewness = float(stats.skew(arr, bias=False))
+    kurtosis = float(stats.kurtosis(arr, bias=False))
+
+    # Wilcoxon signed-rank test — requires non-zero differences
+    nonzero = arr[arr != 0]
+    if len(nonzero) >= 10:
+        try:
+            w_stat, w_p = stats.wilcoxon(nonzero, alternative="two-sided")
+            w_stat, w_p = float(w_stat), float(w_p)
+        except ValueError:
+            w_stat, w_p = None, None
+    else:
+        w_stat, w_p = None, None
+
+    # Sign test: is the number of negatives significantly > 50 %?
+    n_neg = int(np.sum(arr < 0))
+    n_total = len(arr)
+    sign_result = stats.binomtest(n_neg, n_total, p=0.5, alternative="greater")
+    sign_p = float(sign_result.pvalue)
+
+    return {
+        "wilcoxon_stat": w_stat,
+        "wilcoxon_p": w_p,
+        "sign_test_p": sign_p,
+        "skewness": skewness,
+        "kurtosis": kurtosis,
+    }
+
+
+def placebo_test(
+    car_values: List[float],
+    n_permutations: int = 1000,
+) -> Dict:
+    """Randomisation (placebo) test for the mean CAR.
+
+    Shuffles the sign of each CAR value at random to build a null
+    distribution of the mean under H0 (no systematic effect).
+    Compares the actual mean CAR to this null distribution.
+
+    Args:
+        car_values: Observed CAR values.
+        n_permutations: Number of random permutations.
+
+    Returns:
+        - actual_mean: Observed mean CAR.
+        - null_mean, null_std: Centre and spread of the null distribution.
+        - percentile_rank: Where the actual mean falls (0-100) in the null.
+        - placebo_p_value: Two-sided p-value (fraction of null means at least
+          as extreme as the actual mean in absolute value).
+    """
+    arr = np.array([v for v in car_values if v is not None and not np.isnan(v)])
+
+    empty: Dict = {
+        "actual_mean": None,
+        "null_mean": None,
+        "null_std": None,
+        "percentile_rank": None,
+        "placebo_p_value": None,
+    }
+
+    if len(arr) < 2:
+        if len(arr) == 1:
+            empty["actual_mean"] = float(arr[0])
+        return empty
+
+    rng = np.random.default_rng(seed=123)
+    actual_mean = float(np.mean(arr))
+
+    # Generate null distribution by randomly flipping signs
+    signs = rng.choice([-1, 1], size=(n_permutations, len(arr)))
+    null_means = (signs * arr).mean(axis=1)
+
+    null_mean = float(np.mean(null_means))
+    null_std = float(np.std(null_means, ddof=1))
+    percentile_rank = float(np.mean(null_means <= actual_mean) * 100)
+
+    # Two-sided p-value
+    placebo_p = float(np.mean(np.abs(null_means) >= abs(actual_mean)))
+
+    return {
+        "actual_mean": actual_mean,
+        "null_mean": null_mean,
+        "null_std": null_std,
+        "percentile_rank": percentile_rank,
+        "placebo_p_value": placebo_p,
+    }
 
 
 def compute_car_statistics(car_values: List[float]) -> Dict:
@@ -39,6 +254,8 @@ def compute_car_statistics(car_values: List[float]) -> Dict:
             "n_events": len(arr),
             "ci_lower": None,
             "ci_upper": None,
+            "bootstrap_ci": bootstrap_car_ci(car_values),
+            **compute_nonparametric_tests(car_values),
         }
 
     if len(arr) < 50:
@@ -51,10 +268,14 @@ def compute_car_statistics(car_values: List[float]) -> Dict:
     mean = float(np.mean(arr))
     std = float(np.std(arr, ddof=1))
 
-    # 95% confidence interval
+    # 95% confidence interval (normal theory)
     se = std / np.sqrt(len(arr))
     ci_lower = mean - 1.96 * se
     ci_upper = mean + 1.96 * se
+
+    # Advanced statistics
+    boot = bootstrap_car_ci(car_values)
+    nonparam = compute_nonparametric_tests(car_values)
 
     return {
         "mean": mean,
@@ -66,6 +287,8 @@ def compute_car_statistics(car_values: List[float]) -> Dict:
         "n_events": len(arr),
         "ci_lower": float(ci_lower),
         "ci_upper": float(ci_upper),
+        "bootstrap_ci": boot,
+        **nonparam,
     }
 
 
@@ -185,8 +408,10 @@ def compute_full_statistics(
     """
     output = {}
 
-    # Overall CAR statistics for each window
-    for window in ["car_pre30", "car_post30", "car_post60", "car_post90"]:
+    # Overall CAR statistics for each window (now includes bootstrap CI
+    # and non-parametric tests via compute_car_statistics)
+    car_windows = ["car_pre30", "car_post30", "car_post60", "car_post90"]
+    for window in car_windows:
         values = results_df[window].dropna().tolist()
         output[window] = compute_car_statistics(values)
 
@@ -211,6 +436,42 @@ def compute_full_statistics(
 
     # Sub-sample analysis — targeted subsets where the signal should be strongest
     output["subsample"] = compute_subsample_analysis(results_df)
+
+    # ------------------------------------------------------------------
+    # Multiple-testing correction across all window + sub-sample p-values
+    # ------------------------------------------------------------------
+    all_p_labels: List[str] = []
+    all_p_values: List[Optional[float]] = []
+
+    # Collect p-values from main windows
+    for window in car_windows:
+        p = output[window].get("p_value")
+        all_p_labels.append(window)
+        all_p_values.append(p)
+
+    # Collect p-values from sub-sample analyses
+    for ss_name, ss_data in output.get("subsample", {}).items():
+        for w in ["car_post30", "car_post60", "car_post90"]:
+            if w in ss_data and isinstance(ss_data[w], dict):
+                p = ss_data[w].get("p_value")
+                all_p_labels.append(f"subsample:{ss_name}:{w}")
+                all_p_values.append(p)
+
+    corrected_bh = correct_pvalues(all_p_values, method="bh")
+    corrected_bonf = correct_pvalues(all_p_values, method="bonferroni")
+
+    output["corrected_pvalues"] = {
+        label: {"raw": raw, "bh": bh, "bonferroni": bonf}
+        for label, raw, bh, bonf in zip(
+            all_p_labels, all_p_values, corrected_bh, corrected_bonf
+        )
+    }
+
+    # ------------------------------------------------------------------
+    # Placebo (randomisation) test for the primary CAR[0,+30] window
+    # ------------------------------------------------------------------
+    post30_values = results_df["car_post30"].dropna().tolist()
+    output["placebo_test_post30"] = placebo_test(post30_values)
 
     return output
 
