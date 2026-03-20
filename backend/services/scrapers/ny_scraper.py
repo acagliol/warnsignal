@@ -37,7 +37,7 @@ class NYScraper(BaseScraper):
                 page_results = self._scrape_page(resp, url)
                 self.logger.info(f"NY {url}: {len(page_results)} filings")
                 results.extend(page_results)
-                time.sleep(self.delay_seconds)
+                time.sleep(self.delay)
             except Exception as e:
                 self.logger.warning(f"NY {url} failed: {e}")
 
