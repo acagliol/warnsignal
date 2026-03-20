@@ -153,7 +153,7 @@ def generate_research_memo(
         # Sub-sample highlights
         _text(0.05, y, "SUB-SAMPLE HIGHLIGHTS", fontsize=9, fontweight="bold", fontfamily="monospace")
         y -= 0.02
-        sub_data = stats.get("subsample_analysis", {})
+        sub_data = stats.get("subsample", {})
         sub_lines = []
         for label, sub in sub_data.items():
             sub_car30 = sub.get("car_post30", {})
