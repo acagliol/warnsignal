@@ -124,114 +124,131 @@ def run():
 
     db.commit()
 
-    # Load prices for backtest
+    # Load prices for backtest (include volume for short-selling filters)
     tickers_needed = set(signals_df["ticker"].unique())
     prices_dict = {}
     for ticker in tickers_needed:
         price_rows = db.query(PriceData).filter(PriceData.ticker == ticker).all()
         if price_rows:
             prices_dict[ticker] = pd.DataFrame([
-                {"date": p.date, "open": p.open, "close": p.close}
+                {
+                    "date": p.date,
+                    "open": p.open,
+                    "close": p.close,
+                    "volume": p.volume,
+                }
                 for p in price_rows
             ])
 
+    # Helper to store a backtest run in the DB
+    def _store_run(run_name, config_obj, result_obj, metrics_obj):
+        bt_run = BacktestRun(
+            run_name=run_name,
+            start_date=signals_df["signal_date"].min(),
+            end_date=signals_df["signal_date"].max(),
+            config=json.dumps({
+                "hold_days": config_obj.hold_days,
+                "max_positions": config_obj.max_positions,
+                "min_score": config_obj.min_score,
+                "transaction_cost_bps": config_obj.transaction_cost_bps,
+                "cap_filter": config_obj.cap_filter,
+                "use_borrow_costs": config_obj.use_borrow_costs,
+                "use_variable_costs": config_obj.use_variable_costs,
+                "stop_loss_pct": config_obj.stop_loss_pct,
+                "publication_lag_days": config_obj.publication_lag_days,
+                "min_price": config_obj.min_price,
+                "min_avg_volume": config_obj.min_avg_volume,
+            }),
+            sharpe_ratio=metrics_obj.get("sharpe_ratio"),
+            max_drawdown=metrics_obj.get("max_drawdown"),
+            total_return=metrics_obj.get("total_return"),
+            win_rate=metrics_obj.get("win_rate"),
+            n_trades=metrics_obj.get("n_trades"),
+        )
+        db.add(bt_run)
+        db.commit()
+
+        for trade in result_obj.trades:
+            bt_trade = BacktestTrade(
+                run_id=bt_run.id,
+                filing_id=trade.filing_id,
+                ticker=trade.ticker,
+                entry_date=trade.entry_date,
+                exit_date=trade.exit_date,
+                entry_price=trade.entry_price,
+                exit_price=trade.exit_price,
+                return_pct=trade.return_pct,
+                hold_days=trade.hold_days,
+            )
+            db.add(bt_trade)
+        db.commit()
+
     # ----------------------------------------------------------------
-    # Run 1: Full Sample Short (all signals, short-only)
+    # Run 1: Full Sample Short (all signals, no frictions)
     # ----------------------------------------------------------------
-    config_full = BacktestConfig(
+    config1 = BacktestConfig(
         hold_days=settings.BACKTEST_DEFAULT_HOLD_DAYS,
         max_positions=settings.BACKTEST_MAX_POSITIONS,
     )
 
-    logger.info(f"Running backtest [Full Sample]: hold={config_full.hold_days}d, max_pos={config_full.max_positions}")
-    result_full = run_backtest(signals_df, prices_dict, config_full)
-    metrics_full = compute_metrics(result_full.trades, result_full.equity_curve)
-
-    # Store full-sample backtest results
-    bt_run_full = BacktestRun(
-        run_name="WARN Short Signal v1 -- Full Sample",
-        start_date=signals_df["signal_date"].min(),
-        end_date=signals_df["signal_date"].max(),
-        config=json.dumps({
-            "hold_days": config_full.hold_days,
-            "max_positions": config_full.max_positions,
-            "min_score": config_full.min_score,
-            "transaction_cost_bps": config_full.transaction_cost_bps,
-            "cap_filter": None,
-        }),
-        sharpe_ratio=metrics_full.get("sharpe_ratio"),
-        max_drawdown=metrics_full.get("max_drawdown"),
-        total_return=metrics_full.get("total_return"),
-        win_rate=metrics_full.get("win_rate"),
-        n_trades=metrics_full.get("n_trades"),
-    )
-    db.add(bt_run_full)
-    db.commit()
-
-    for trade in result_full.trades:
-        bt_trade = BacktestTrade(
-            run_id=bt_run_full.id,
-            filing_id=trade.filing_id,
-            ticker=trade.ticker,
-            entry_date=trade.entry_date,
-            exit_date=trade.exit_date,
-            entry_price=trade.entry_price,
-            exit_price=trade.exit_price,
-            return_pct=trade.return_pct,
-            hold_days=trade.hold_days,
-        )
-        db.add(bt_trade)
-    db.commit()
+    logger.info(f"Running backtest [Full Sample Short]: hold={config1.hold_days}d, max_pos={config1.max_positions}")
+    result1 = run_backtest(signals_df, prices_dict, config1)
+    metrics1 = compute_metrics(result1.trades, result1.equity_curve)
+    _store_run("WARN Short Signal v1 -- Full Sample Short", config1, result1, metrics1)
 
     # ----------------------------------------------------------------
-    # Run 2: Micro+Small Cap Short (filtered by market_cap_bucket)
+    # Run 2: Micro+Small Cap Short (filtered, no frictions)
     # ----------------------------------------------------------------
-    config_small = BacktestConfig(
+    config2 = BacktestConfig(
         hold_days=settings.BACKTEST_DEFAULT_HOLD_DAYS,
         max_positions=settings.BACKTEST_MAX_POSITIONS,
         cap_filter=["micro", "small"],
     )
 
-    logger.info(f"Running backtest [Micro+Small Cap]: hold={config_small.hold_days}d, max_pos={config_small.max_positions}")
-    result_small = run_backtest(signals_df, prices_dict, config_small)
-    metrics_small = compute_metrics(result_small.trades, result_small.equity_curve)
+    logger.info(f"Running backtest [Micro+Small Cap Short]: hold={config2.hold_days}d, max_pos={config2.max_positions}")
+    result2 = run_backtest(signals_df, prices_dict, config2)
+    metrics2 = compute_metrics(result2.trades, result2.equity_curve)
+    _store_run("WARN Short Signal v1 -- Micro+Small Cap Short", config2, result2, metrics2)
 
-    # Store micro+small backtest results
-    bt_run_small = BacktestRun(
-        run_name="WARN Short Signal v1 -- Micro+Small Cap",
-        start_date=signals_df["signal_date"].min(),
-        end_date=signals_df["signal_date"].max(),
-        config=json.dumps({
-            "hold_days": config_small.hold_days,
-            "max_positions": config_small.max_positions,
-            "min_score": config_small.min_score,
-            "transaction_cost_bps": config_small.transaction_cost_bps,
-            "cap_filter": ["micro", "small"],
-        }),
-        sharpe_ratio=metrics_small.get("sharpe_ratio"),
-        max_drawdown=metrics_small.get("max_drawdown"),
-        total_return=metrics_small.get("total_return"),
-        win_rate=metrics_small.get("win_rate"),
-        n_trades=metrics_small.get("n_trades"),
+    # ----------------------------------------------------------------
+    # Run 3: Micro+Small Cap + Frictions (borrow costs + variable
+    #         transaction costs + 30% stop-loss)
+    # ----------------------------------------------------------------
+    config3 = BacktestConfig(
+        hold_days=settings.BACKTEST_DEFAULT_HOLD_DAYS,
+        max_positions=settings.BACKTEST_MAX_POSITIONS,
+        cap_filter=["micro", "small"],
+        use_borrow_costs=True,
+        use_variable_costs=True,
+        stop_loss_pct=0.30,
     )
-    db.add(bt_run_small)
-    db.commit()
 
-    for trade in result_small.trades:
-        bt_trade = BacktestTrade(
-            run_id=bt_run_small.id,
-            filing_id=trade.filing_id,
-            ticker=trade.ticker,
-            entry_date=trade.entry_date,
-            exit_date=trade.exit_date,
-            entry_price=trade.entry_price,
-            exit_price=trade.exit_price,
-            return_pct=trade.return_pct,
-            hold_days=trade.hold_days,
-        )
-        db.add(bt_trade)
+    logger.info(
+        f"Running backtest [Micro+Small Cap + Frictions]: hold={config3.hold_days}d, "
+        f"max_pos={config3.max_positions}, stop_loss=30%, borrow+variable costs"
+    )
+    result3 = run_backtest(signals_df, prices_dict, config3)
+    metrics3 = compute_metrics(result3.trades, result3.equity_curve)
+    _store_run("WARN Short Signal v1 -- Micro+Small Cap + Frictions", config3, result3, metrics3)
 
-    db.commit()
+    # ----------------------------------------------------------------
+    # Run 4: Micro+Small Cap + Publication Lag (3-day lag)
+    # ----------------------------------------------------------------
+    config4 = BacktestConfig(
+        hold_days=settings.BACKTEST_DEFAULT_HOLD_DAYS,
+        max_positions=settings.BACKTEST_MAX_POSITIONS,
+        cap_filter=["micro", "small"],
+        publication_lag_days=3,
+    )
+
+    logger.info(
+        f"Running backtest [Micro+Small Cap + Publication Lag]: hold={config4.hold_days}d, "
+        f"max_pos={config4.max_positions}, pub_lag=3d"
+    )
+    result4 = run_backtest(signals_df, prices_dict, config4)
+    metrics4 = compute_metrics(result4.trades, result4.equity_curve)
+    _store_run("WARN Short Signal v1 -- Micro+Small Cap + Publication Lag", config4, result4, metrics4)
+
     db.close()
 
     # Print results
@@ -247,8 +264,10 @@ def run():
         print(f"  Avg Return/Trade: {metrics.get('avg_return', 'N/A')}")
         print(f"{'=' * 60}")
 
-    _print_results("FULL SAMPLE SHORT (all signals)", metrics_full)
-    _print_results("MICRO+SMALL CAP SHORT (filtered)", metrics_small)
+    _print_results("FULL SAMPLE SHORT (all signals, no frictions)", metrics1)
+    _print_results("MICRO+SMALL CAP SHORT (filtered, no frictions)", metrics2)
+    _print_results("MICRO+SMALL CAP + FRICTIONS (borrow + variable costs + 30% stop)", metrics3)
+    _print_results("MICRO+SMALL CAP + PUBLICATION LAG (3-day lag)", metrics4)
 
 
 if __name__ == "__main__":
